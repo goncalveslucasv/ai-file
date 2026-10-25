@@ -1,0 +1,59 @@
+{
+  "name": "ai-file",
+  "version": "0.1.0",
+  "description": "Native reader/writer for Adobe Illustrator (.ai) files: decodes the Illustrator private data (PGF/AI text stream), not just the PDF preview.",
+  "keywords": [
+    "adobe-illustrator",
+    "illustrator",
+    ".ai",
+    "ai-file",
+    "vector",
+    "pdf",
+    "svg",
+    "reverse-engineering",
+    "parser",
+    "file-format"
+  ],
+  "homepage": "https://github.com/goncalveslucasv/ai-file#readme",
+  "bugs": {
+    "url": "https://github.com/goncalveslucasv/ai-file/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/goncalveslucasv/ai-file.git"
+  },
+  "license": "MIT",
+  "author": "Lucas Goncalves",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "docs"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.ts",
+    "inspect": "node scripts/ai-inspect.ts",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "fzstd": "^0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
