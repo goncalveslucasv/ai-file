@@ -62,11 +62,12 @@ test("new document -> .ai file -> read back", () => {
   insertArt(doc.layers[0], rect);
   insertArt(doc.layers[0], circle);
   translateArt(doc, circle, 10, 0);
-  for (const rendition of ["generate"] as const) {
-    const bytes = saveAiFile(doc, undefined, { rendition });
+  for (const compression of ["zstd", "deflate", "none"] as const) {
+    const bytes = saveAiFile(doc, undefined, { rendition: "generate", compression });
     const c = openAiContainer(bytes);
     assert.equal(c.format, "pdf");
-    assert.equal(c.compression, "deflate");
+    assert.equal(c.compression, compression);
+    assert.equal(c.privateInfo?.roundtripStreamType, { zstd: 2, deflate: 1, none: 0 }[compression]);
     assert.equal(c.pageCount, 1);
     const back = parseAiStream(c.stream);
     assert.equal(back.warnings.length, 0, back.warnings.join("\n"));
@@ -75,4 +76,14 @@ test("new document -> .ai file -> read back", () => {
     assert.equal(paths.length, 2);
     assert.deepEqual(paths[1].segments[0].x, 390);
   }
+});
+
+test("unchanged document reuses the compressed private data", () => {
+  const doc = createDocument({ artboards: [{ width: 100, height: 100 }] });
+  const first = saveAiFile(doc, undefined, { compression: "deflate" });
+  const c = openAiContainer(first);
+  const again = parseAiStream(c.stream);
+  const second = openAiContainer(saveAiFile(again, c, { rendition: "generate" }));
+  assert.equal(second.compression, "deflate");
+  assert.deepEqual(second.privateBlocks, c.privateBlocks);
 });

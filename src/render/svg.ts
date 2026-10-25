@@ -11,7 +11,8 @@ import { colorCss, rgbHex, toRgb } from "../model/color.ts";
 import type { AiDocument, Art, GradientDef, GradientPaint, MeshArt, Paint, PathArt, PathStyle, RasterArt, TextArt } from "../model/types.ts";
 import type { TextDocument, TextPaint } from "../text/txt2.ts";
 import { tessellateMesh } from "./mesh.ts";
-import { bytesToBase64, encodePng, rasterToRgba } from "./png.ts";
+import { artBounds, intersects, type Bounds } from "../model/bounds.ts";
+import { bytesToBase64, rasterToPng } from "./png.ts";
 
 export interface SvgOptions {
   /** Longest side for embedded images (default 2048). */
@@ -24,7 +25,12 @@ export interface SvgOptions {
   meshSteps?: number;
   /** Add a white page background (default true). */
   background?: string | null;
+  /** PNG compression level for embedded images, 0-9 (default 2: fast, slightly larger). */
+  imageLevel?: number;
 }
+
+/** Encoded images per document, shared by every render of that document. */
+const imageCaches = new WeakMap<AiDocument, Map<string, string>>();
 
 const f = (n: number): string => {
   if (!Number.isFinite(n)) return "0";
@@ -57,11 +63,17 @@ class SvgBuilder {
   readonly opts: Required<Omit<SvgOptions, "imageHref" | "background">> & Pick<SvgOptions, "imageHref" | "background">;
   defs: string[] = [];
   private uid = 0;
-  private imageCache = new Map<number, string>();
+  private imageCache: Map<string, string>;
+  /** Art outside this area (the artboard) is skipped. */
+  private view?: Bounds;
 
-  constructor(doc: AiDocument, opts: SvgOptions) {
+  constructor(doc: AiDocument, opts: SvgOptions, view?: Bounds) {
     this.doc = doc;
-    this.opts = { maxImageSize: 2048, preferSource: false, meshSteps: 8, ...opts };
+    this.opts = { maxImageSize: 2048, preferSource: false, meshSteps: 8, imageLevel: 2, ...opts };
+    this.view = view;
+    let cache = imageCaches.get(doc);
+    if (!cache) imageCaches.set(doc, (cache = new Map()));
+    this.imageCache = cache;
   }
 
   id(prefix: string): string {
@@ -147,6 +159,10 @@ class SvgBuilder {
 
   art(a: Art): string {
     if (a.hidden) return "";
+    if (this.view && a.type !== "layer") {
+      const b = artBounds(a);
+      if (b && !intersects(b, this.view)) return "";
+    }
     if (this.opts.preferSource && a.source?.length) return a.source.map((x) => this.art(x)).join("");
     switch (a.type) {
       case "layer":
@@ -200,12 +216,13 @@ class SvgBuilder {
   raster(a: RasterArt): string {
     let href = this.opts.imageHref?.(a) ?? null;
     if (!href) {
-      href = this.imageCache.get(a.dataRange?.[0] ?? -1) ?? null;
+      const key = `${a.dataRange?.[0]}:${this.opts.maxImageSize}:${this.opts.imageLevel}`;
+      href = this.imageCache.get(key) ?? null;
       if (!href) {
-        const img = rasterToRgba(a, this.doc.source, this.opts.maxImageSize);
+        const img = rasterToPng(a, this.doc.source, this.opts.maxImageSize, this.opts.imageLevel);
         if (!img) return "";
-        href = `data:image/png;base64,${bytesToBase64(encodePng(img.rgba, img.width, img.height))}`;
-        if (a.dataRange) this.imageCache.set(a.dataRange[0], href);
+        href = `data:image/png;base64,${bytesToBase64(img.png)}`;
+        if (a.dataRange) this.imageCache.set(key, href);
       }
     }
     const [ma, mb, mc, md, tx, ty] = a.matrix;
@@ -314,7 +331,7 @@ export function fontInfo(psName: string): { family: string; weight: number; ital
 export function renderArtboardSvg(doc: AiDocument, artboardIndex = 0, options: SvgOptions = {}): string {
   const ab = doc.artboards[artboardIndex];
   if (!ab) throw new Error(`No artboard ${artboardIndex}`);
-  const b = new SvgBuilder(doc, options);
+  const b = new SvgBuilder(doc, options, [ab.left, ab.bottom, ab.right, ab.top]);
   const w = ab.right - ab.left;
   const h = ab.top - ab.bottom;
   const body = doc.layers.map((l) => b.art(l)).join("");

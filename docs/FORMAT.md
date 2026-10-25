@@ -211,7 +211,7 @@ ruler origin — verified exactly against PDF text positions ("CTO" at (482.56, 
 * Area text and text on a path frames are parsed generically but not modelled (no sample).
 * Symbol instances, placed (linked) art, charts, Live Paint, blends: kept verbatim, not modelled.
 * Meshes are read and rendered, but written back verbatim (geometry edits are not persisted).
-* Writing uses `%AI12_CompressedData` (zlib); zstd encoding is not implemented. Illustrator 2020+
-  should read zlib-compressed private data, but **reopening written files in Illustrator has not
-  been verified** (Illustrator was not available).
+* Writing uses `%AI24_ZStandard_Data` (one zstd frame, level 3, `RoundtripStreamType 2`) by
+  default, or `%AI12_CompressedData` (zlib, `RoundtripStreamType 1`). **Reopening written files
+  in Illustrator has not been verified** (Illustrator was not available).
 * Edited text keeps Illustrator's cached composition; Illustrator is expected to recompose it.

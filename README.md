@@ -7,10 +7,11 @@
 [![CI](https://github.com/goncalveslucasv/ai-file/actions/workflows/ci.yml/badge.svg)](https://github.com/goncalveslucasv/ai-file/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)
-![Runtime deps](https://img.shields.io/badge/runtime%20deps-2%20(pure%20JS)-brightgreen)
+![Runtime deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)
+![Rust + WebAssembly](https://img.shields.io/badge/codecs-Rust%20%2B%20WebAssembly-dea584?logo=rust&logoColor=white)
 ![Node](https://img.shields.io/badge/node-%E2%89%A522.18-339933?logo=node.js&logoColor=white)
 
-[Quick start](#quick-start) · [Recipes](#recipes) · [API](#api) · [How it works](#how-it-works) · [Format spec](docs/FORMAT.md) · [Status](#status)
+[Quick start](#quick-start) · [Recipes](#recipes) · [API](#api) · [Performance](#performance) · [How it works](#how-it-works) · [Format spec](docs/FORMAT.md) · [Status](#status)
 
 </div>
 
@@ -52,11 +53,16 @@ const svg = renderArtboardSvg(document, 0);         // high-fidelity SVG of artb
   serializes **byte-identical**. Only what you change is regenerated.
 - 🖼️ **Rendering built in.** Artboard → SVG (gradients, masks, blend modes, meshes, images,
   text), raster → PNG, and a fresh PDF preview when saving.
-- ⚡ **Fast.** A 1 GB native stream parses in ~0.2 s after decompression; decompression is
-  streaming.
-- 🌐 **Universal & tiny.** Strict TypeScript, ESM, no native modules, no WASM. Two pure-JS
-  dependencies: [`fflate`](https://github.com/101arrowz/fflate) and
-  [`fzstd`](https://github.com/101arrowz/fzstd).
+- ⚡ **Fast.** Opens a 647 MB file (1 GB native stream) in **1.5 s**, renders all its
+  artboards in **0.6 s** and re-saves it unchanged in **0.5 s**. [Numbers below](#performance).
+- 🦀 **Rust + WebAssembly where it counts.** Compression and pixel work run in a single
+  embedded WebAssembly module built from battle-tested libraries: the reference
+  [`libzstd`](https://github.com/facebook/zstd), [`zlib-rs`](https://github.com/trifectatechfoundation/zlib-rs)
+  and the [`png`](https://github.com/image-rs/image-png) crate. Data streams through it in
+  chunks, so a 1 GB payload never has to fit in wasm memory.
+- 🌐 **Universal, zero dependencies.** Strict TypeScript, ESM. The same build runs in Node,
+  browsers, workers and bundlers — no native addons, no `.wasm` file to serve, no async init
+  required.
 - 📖 **Documented format.** The reverse-engineered specification lives in
   [`docs/FORMAT.md`](docs/FORMAT.md).
 
@@ -66,8 +72,9 @@ const svg = renderArtboardSvg(document, 0);         // high-fidelity SVG of artb
 npm install github:goncalveslucasv/ai-file
 ```
 
-The package builds itself on install (`prepare`). Requires Node ≥ 22.18 for development
-(native TypeScript); the built output runs in any modern browser or bundler.
+The package builds itself on install (`prepare`); the WebAssembly module ships prebuilt, so no
+Rust toolchain is needed to use it. Requires Node ≥ 22.18 for development (native TypeScript);
+the built output runs in any modern browser or bundler.
 
 ## Quick start
 
@@ -206,6 +213,9 @@ for (const st of lex(c.stream).slice(0, 50)) console.log(st.hidden ? "%_" : "  "
 
 Options: `onProgress(done, total)` during decompression, `skipText` to skip the text engine.
 
+The WebAssembly codecs instantiate synchronously on first use. `readAiFile` (and an optional
+`await initWasm()`) compile them asynchronously instead, which keeps a browser's main thread free.
+
 ### The document model
 
 ```ts
@@ -246,12 +256,15 @@ Every art node carries its `style` (fill, stroke, dash, blend mode, opacity), op
 
 ```ts
 saveAiFile(doc, container?, {
-  rendition: "keep" | "generate",   // reuse the original PDF preview, or build a new one from the model
-  compression: "deflate" | "none",
-  compressionLevel: 6,
+  rendition: "keep" | "generate",       // reuse the original PDF preview, or build a new one from the model
+  compression: "zstd" | "deflate" | "none", // default: the original file's, else zstd (like Illustrator 2020+)
+  compressionLevel: 3,                  // zstd 1-22 / deflate 0-9
   title: "Business card",
 }): Uint8Array
 ```
+
+If nothing was edited, the original compressed private data is reused as is — saving costs
+little more than writing the file.
 
 `serializeAiStream(doc)` returns just the native stream if you want to embed it yourself.
 
@@ -259,14 +272,38 @@ saveAiFile(doc, container?, {
 
 | Function | Description |
 |---|---|
-| `renderArtboardSvg(doc, index, { maxImageSize, preferSource, imageHref, meshSteps, background })` | Artboard → SVG string |
-| `rasterToRgba(art, doc.source, maxSize?)` · `encodePng(rgba, w, h)` | Embedded images |
+| `renderArtboardSvg(doc, index, { maxImageSize, imageLevel, preferSource, imageHref, meshSteps, background })` | Artboard → SVG string. Only art that touches the artboard is emitted; encoded images are cached per document. |
+| `rasterToPng(art, doc.source, maxSize?)` · `rasterToRgba(…)` · `rasterToPlanes(…)` · `encodePng(rgba, w, h)` | Embedded images |
+| `artBounds(art)` | Conservative bounding box in art space |
 | `pathData(pathArt)` | Path → SVG `d` attribute |
 
 ### Low level
 
 `lex` (tokenizer for the PostScript dialect), `parseDictBlock` / `writeDict` (Illustrator's
-dictionary language), `parseTxt2` / `writeTxt2` (text engine payloads), `PdfReader`.
+dictionary language), `parseTxt2` / `writeTxt2` (text engine payloads), `PdfReader`, and the
+codecs themselves: `zstdDecompress` / `zstdCompress` / `inflate` / `deflate` (streaming, accept
+a `Uint8Array` or any iterable of chunks).
+
+## Performance
+
+Measured on a 647 MB Illustrator 2026 document (8 artboards, 32 embedded images, 1 GB native
+stream), Node 24, Apple Silicon:
+
+| Operation | v0.1 (pure JS) | Now (Rust/WASM codecs) | |
+|---|--:|--:|--:|
+| Open + parse | 7.2 s | **1.5 s** | 4.8× |
+| Render all 8 artboards to SVG | 30 s | **0.6 s** (0.07 s warm) | 50× |
+| Save, unchanged | 18 s | **0.5 s** | 36× |
+| Save, edited, keep PDF preview | 18 s | **5.9 s** | 3× |
+| Save, edited, new PDF preview | 28 s | **11 s** | 2.5× |
+
+Where the time goes: zstd decompression 1.3 s (fzstd took 6.8 s; native libzstd takes 1.1 s),
+tokenizing + parsing 0.24 s, zstd level-3 compression 5 s. The SVG speed-up comes from
+artboard culling and a per-document image cache, plus PNG encoding in Rust.
+
+The parser stays in TypeScript on purpose: it is already ~0.2 s for 1 GB, and moving it into
+WebAssembly would mean copying the whole stream into wasm memory (capped at 4 GB, and 64-bit
+memory is not available in Safari) for almost no gain.
 
 ## How it works
 
@@ -277,7 +314,7 @@ dictionary language), `parseTxt2` / `writeTxt2` (text engine payloads), `PdfRead
       ├── AIMetaData                        header comments
       └── AIPrivateData1 … N  (64 KB each)  ─┐
                                              │ concatenate, strip "%AI24_ZStandard_Data"
-                                             ▼ zstd / zlib  (streaming)
+                                             ▼ zstd / zlib  (streaming, Rust → WebAssembly)
                           native stream  (PostScript dialect, ~1 GB in the sample)
                                              │
                     lex ─────────────────────┤  statements tile the source exactly
@@ -330,10 +367,12 @@ positions, colors, gradient vectors, fonts and text baselines match.
 - parses with 0 warnings; SVG renderings match Illustrator's own PDF rendition;
 - unedited save is byte-identical; regenerating *every* object reproduces an identical model and
   identical renderings;
-- edited files reopen cleanly and their generated PDF previews render in macOS PDFKit.
+- edited files reopen cleanly and their generated PDF previews render in macOS PDFKit;
+- the WebAssembly build runs in Chrome (synchronous and asynchronous instantiation).
 
-**Not yet verified:** reopening written files in Illustrator itself. Saving uses
-`%AI12_CompressedData` (zlib), which Illustrator 2020+ is expected to read. If you try it, please
+**Not yet verified:** reopening written files in Illustrator itself. Saving writes
+`%AI24_ZStandard_Data` (a single zstd frame, like Illustrator 2020+) by default, or
+`%AI12_CompressedData` (zlib) on request. If you try it, please
 [open an issue](https://github.com/goncalveslucasv/ai-file/issues) with the result.
 
 ## CLI
@@ -357,10 +396,25 @@ npm run build                             # → dist/
 
 The source runs directly on Node's native TypeScript support — no build step for tests or scripts.
 
+### The WebAssembly codecs
+
+The Rust crate lives in [`wasm/`](wasm/src/lib.rs) and is embedded into
+`src/wasm/binary.ts`, which is committed — you only need Rust to change it:
+
+```sh
+rustup target add wasm32-unknown-unknown
+# libzstd is C: point to a clang that targets wasm32, e.g. a wasi-sdk install
+WASI_SDK_PATH=/path/to/wasi-sdk npm run build:wasm
+```
+
+The module has a tiny C ABI (no wasm-bindgen): codecs pull input through an imported
+`js_read` and push output through `js_write`, so JavaScript owns every large buffer.
+
 ## Roadmap
 
 - [ ] Verify round-trip in Illustrator; collect a corpus of files across versions (CS6 → 2026)
-- [ ] zstd encoding for `%AI24_ZStandard_Data`
+- [x] zstd encoding for `%AI24_ZStandard_Data`
+- [ ] Parse and render in a Web Worker with transferable buffers
 - [ ] Area text and text on a path
 - [ ] Symbol instances and placed (linked) art
 - [ ] Editable meshes
@@ -375,7 +429,9 @@ fixable. Please don't attach files you don't have the rights to share.
 ## Acknowledgments
 
 The initial binary map of the container was made with [REA](https://github.com/morluto/rea)'s
-byte-entropy analysis. Format knowledge builds on Adobe's public *Adobe Illustrator File Format
+byte-entropy analysis. Codecs: [zstd](https://github.com/facebook/zstd) via
+[zstd-rs](https://github.com/gyscos/zstd-rs), [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs),
+[image-png](https://github.com/image-rs/image-png). Format knowledge builds on Adobe's public *Adobe Illustrator File Format
 Specification* (AI 3/7), extended here up to the AI24 stream.
 
 ## License

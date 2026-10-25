@@ -11,8 +11,7 @@
 //  - Legacy PostScript .ai (Illustrator <= 8, or "PDF compatible" off): the file *is* the stream.
 //  - DOS EPS binary header (C5 D0 D3 C6): the PostScript section is the stream.
 
-import { Decompress as ZstdDecompress } from "fzstd";
-import { Unzlib, Inflate } from "fflate";
+import { inflate, zstdDecompress } from "../wasm/codec.ts";
 import { concatBytes, indexOf, latin1, startsWith } from "../bytes.ts";
 import { PdfReader, isRef, isStream, type PdfDict, type PdfStream, type PdfValue } from "./pdf.ts";
 
@@ -39,6 +38,8 @@ export interface AiContainer {
   privateInfo?: AiPrivateInfo;
   /** Number of PDF pages (one per artboard) when the PDF rendition exists. */
   pageCount?: number;
+  /** The original AIPrivateData blocks, still compressed (reused when saving an unchanged stream). */
+  privateBlocks?: Uint8Array[];
 }
 
 export interface OpenOptions {
@@ -98,7 +99,7 @@ function openPdfContainer(bytes: Uint8Array, options: OpenOptions): AiContainer 
     privateObject: objectNumber,
   };
   const { stream, compression } = decodePrivateBlocks(blocks, options);
-  return { format: "pdf", pdf, stream, metadata, compression, privateInfo, pageCount: countPages(pdf) };
+  return { format: "pdf", pdf, stream, metadata, compression, privateInfo, pageCount: countPages(pdf), privateBlocks: blocks };
 }
 
 function readStreamBytes(pdf: PdfReader, s: PdfStream): Uint8Array {
@@ -160,28 +161,13 @@ export function decodePrivateBlocks(blocks: Uint8Array[], options: OpenOptions =
   }
   if (compression === "none") return { stream: blocks.length === 1 ? first : concatBytes(blocks), compression };
 
-  const out: Uint8Array[] = [];
-  let done = 0;
-  const feed = (push: (chunk: Uint8Array, final: boolean) => void): void => {
-    blocks.forEach((b, i) => {
-      const chunk = i === 0 ? b.subarray(skip) : b;
-      push(chunk, i === blocks.length - 1);
-      done += b.length;
-      options.onProgress?.(done, total);
-    });
-  };
-  if (compression === "zstd") {
-    const d = new ZstdDecompress((data) => {
-      out.push(data);
-    });
-    feed((c, final) => d.push(c, final));
-  } else {
-    // zlib header (78 xx) is the norm; fall back to raw deflate otherwise.
-    const firstByte = first[skip];
-    const z = (firstByte & 0x0f) === 8 ? new Unzlib((data) => out.push(data)) : new Inflate((data) => out.push(data));
-    feed((c, final) => z.push(c, final));
+  // Feed the blocks lazily so progress follows the decompression.
+  function* chunks(): Generator<Uint8Array> {
+    for (let i = 0; i < blocks.length; i++) yield i === 0 ? first.subarray(skip) : blocks[i];
   }
-  return { stream: out.length === 1 ? out[0] : concatBytes(out), compression };
+  const onRead = options.onProgress && ((n: number) => options.onProgress!(n + skip, total));
+  const stream = compression === "zstd" ? zstdDecompress(chunks(), { sizeHint: total * 3, onRead }) : inflate(chunks(), "auto", { sizeHint: total * 3, onRead });
+  return { stream, compression };
 }
 
 /** Quick check usable on a file header (first ~1 KB). */

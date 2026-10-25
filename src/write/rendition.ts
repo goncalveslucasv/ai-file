@@ -2,11 +2,12 @@
 // Illustrator itself ignores this rendition when the private data is present; it is what
 // other PDF readers, Finder previews, browsers... display.
 
-import { zlibSync } from "fflate";
 import { ByteWriter, fmt } from "../bytes.ts";
 import { toRgb } from "../model/color.ts";
 import type { AiDocument, Art, Artboard, GradientDef, GradientPaint, MeshArt, Paint, PathArt, PathSegment, RasterArt, TextArt } from "../model/types.ts";
 import { tessellateMesh } from "../render/mesh.ts";
+import { rasterToPlanes } from "../render/png.ts";
+import { deflate } from "../wasm/codec.ts";
 import { textToArt, type TextDocument, type TextPaint } from "../text/txt2.ts";
 import { name, ref, type PdfBuilder, type PVal } from "./pdfobj.ts";
 
@@ -49,7 +50,7 @@ export class RenditionBuilder {
       for (const layer of this.doc.layers) this.art(layer, body, res, 1, ab);
       const content = this.pdf.alloc();
       const data = body.toBytes();
-      this.pdf.stream(content, { Filter: name("FlateDecode") }, zlibSync(data, { level: 6 }));
+      this.pdf.stream(content, { Filter: name("FlateDecode") }, deflate(data, 6));
       const page = this.pdf.alloc();
       const w = ab.right - ab.left, h = ab.top - ab.bottom;
       const box = [0, 0, w, h];
@@ -237,15 +238,15 @@ export class RenditionBuilder {
     const key = `${a.dataRange?.[0]}`;
     let num = this.images.get(key);
     if (num === undefined) {
-      const img = rasterRgb(a, this.doc.source, this.opts.maxImageSize);
+      const img = rasterToPlanes(a, this.doc.source, this.opts.maxImageSize);
       if (!img) return;
       let smask: number | undefined;
       if (img.alpha) {
         smask = this.pdf.alloc();
-        this.pdf.stream(smask, { Type: name("XObject"), Subtype: name("Image"), Width: img.width, Height: img.height, ColorSpace: name("DeviceGray"), BitsPerComponent: 8, Filter: name("FlateDecode") }, zlibSync(img.alpha, { level: this.opts.level as 6 }));
+        this.pdf.stream(smask, { Type: name("XObject"), Subtype: name("Image"), Width: img.width, Height: img.height, ColorSpace: name("DeviceGray"), BitsPerComponent: 8, Filter: name("FlateDecode") }, deflate(img.alpha, this.opts.level));
       }
       num = this.pdf.alloc();
-      this.pdf.stream(num, { Type: name("XObject"), Subtype: name("Image"), Width: img.width, Height: img.height, ColorSpace: name("DeviceRGB"), BitsPerComponent: 8, Filter: name("FlateDecode"), SMask: smask ? ref(smask) : undefined }, zlibSync(img.rgb, { level: this.opts.level as 6 }));
+      this.pdf.stream(num, { Type: name("XObject"), Subtype: name("Image"), Width: img.width, Height: img.height, ColorSpace: name("DeviceRGB"), BitsPerComponent: 8, Filter: name("FlateDecode"), SMask: smask ? ref(smask) : undefined }, deflate(img.rgb, this.opts.level));
       this.images.set(key, num);
     }
     const k = `Im${res.xobjects.size}`;
@@ -324,34 +325,3 @@ function winAnsi(text: string): string {
   return out + ")";
 }
 
-function rasterRgb(a: RasterArt, src: Uint8Array, maxSize: number): { rgb: Uint8Array; alpha?: Uint8Array; width: number; height: number } | null {
-  if (!a.dataRange || a.bitsPerComponent !== 8) return null;
-  const [start, end] = a.dataRange;
-  const w = a.width, h = a.height, ch = a.channels;
-  const colorBytes = w * h * ch;
-  if (end - start < colorBytes) return null;
-  const hasAlpha = a.alphaChannels > 0 && end - start >= colorBytes + w * h;
-  const scale = Math.min(1, maxSize / Math.max(w, h));
-  const ow = Math.max(1, Math.round(w * scale)), oh = Math.max(1, Math.round(h * scale));
-  if (scale === 1 && ch === 3) {
-    return { rgb: src.subarray(start, start + colorBytes), alpha: hasAlpha ? src.subarray(start + colorBytes, start + colorBytes + w * h) : undefined, width: w, height: h };
-  }
-  const rgb = new Uint8Array(ow * oh * 3);
-  const alpha = hasAlpha ? new Uint8Array(ow * oh) : undefined;
-  for (let y = 0; y < oh; y++) {
-    const sy = Math.min(h - 1, Math.floor((y + 0.5) / scale));
-    for (let x = 0; x < ow; x++) {
-      const sx = Math.min(w - 1, Math.floor((x + 0.5) / scale));
-      const si = start + (sy * w + sx) * ch;
-      const o = (y * ow + x) * 3;
-      if (ch === 3) {
-        rgb[o] = src[si]; rgb[o + 1] = src[si + 1]; rgb[o + 2] = src[si + 2];
-      } else if (ch === 4) {
-        const c = toRgb({ kind: "cmyk", c: src[si] / 255, m: src[si + 1] / 255, y: src[si + 2] / 255, k: src[si + 3] / 255 });
-        rgb[o] = c[0] * 255; rgb[o + 1] = c[1] * 255; rgb[o + 2] = c[2] * 255;
-      } else rgb[o] = rgb[o + 1] = rgb[o + 2] = src[si];
-      if (alpha) alpha[y * ow + x] = src[start + colorBytes + sy * w + sx];
-    }
-  }
-  return { rgb, alpha, width: ow, height: oh };
-}

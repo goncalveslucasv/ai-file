@@ -3,7 +3,7 @@
 // (classic and stream based, including incremental updates), indirect objects, object
 // streams and Flate-decoded streams.
 
-import { unzlibSync, inflateSync } from "fflate";
+import { inflate } from "../wasm/codec.ts";
 import { indexOf, lastIndexOf, latin1 } from "../bytes.ts";
 
 export interface PdfRef {
@@ -366,9 +366,10 @@ export class PdfReader {
       if (!isName(f)) return;
       if (f.name === "FlateDecode") {
         try {
-          data = unzlibSync(data);
+          data = inflate(data, "auto", { sizeHint: data.length * 4 });
         } catch {
-          data = inflateSync(data.subarray(2));
+          // Damaged zlib header or checksum: retry as raw deflate after the 2-byte header.
+          data = inflate(data.subarray(2), "raw", { sizeHint: data.length * 4 });
         }
         const parms = parmsList[idx];
         if (parms instanceof Map) data = applyPredictor(data, parms);

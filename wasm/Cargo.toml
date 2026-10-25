@@ -1,0 +1,21 @@
+[package]
+name = "ai-file-wasm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zstd = { version = "0.14", default-features = false }
+zlib-rs = "0.6"
+miniz_oxide = "0.9"
+png = "0.18"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

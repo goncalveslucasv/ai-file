@@ -5,12 +5,13 @@
 //    private data (fast; the rendition shows the document as it was before editing).
 //  - "generate": build a new rendition from the model (one page per artboard).
 //
-// The native stream is stored deflate-compressed with the "%AI12_CompressedData" tag, split in
-// 64 KiB blocks like Illustrator does.
+// The native stream is stored zstd-compressed with the "%AI24_ZStandard_Data" tag (as Illustrator
+// 2020+ writes it) or deflate-compressed with "%AI12_CompressedData", split in 64 KiB blocks like
+// Illustrator does. When the stream did not change, the original compressed blocks are reused.
 
-import { Zlib } from "fflate";
-import { ByteWriter, concatBytes, indexOf, latin1 } from "../bytes.ts";
-import type { AiContainer } from "../container/ai.ts";
+import { concatBytes, fromLatin1, indexOf, latin1 } from "../bytes.ts";
+import type { AiCompression, AiContainer } from "../container/ai.ts";
+import { deflate, zstdCompress } from "../wasm/codec.ts";
 import { isRef, isStream, type PdfReader } from "../container/pdf.ts";
 import type { AiDocument } from "../model/types.ts";
 import { PdfBuilder, name, ref, raw, type PVal } from "./pdfobj.ts";
@@ -20,9 +21,9 @@ import { serializeAiStream, type SerializeOptions } from "./stream.ts";
 export interface SaveOptions extends SerializeOptions, RenditionOptions {
   /** PDF rendition strategy (default: "keep" when the original container is a PDF, else "generate"). */
   rendition?: "keep" | "generate";
-  /** Private data compression (default "deflate"). */
-  compression?: "deflate" | "none";
-  /** zlib level 0-9 for the private data (default 6). */
+  /** Private data compression (default: the original file's, else "zstd"). */
+  compression?: AiCompression;
+  /** Compression level: zstd 1-22 (default 3), deflate 0-9 (default 6). */
   compressionLevel?: number;
   /** Size of each AIPrivateData block (default 65536). */
   blockSize?: number;
@@ -32,30 +33,20 @@ export interface SaveOptions extends SerializeOptions, RenditionOptions {
 
 const BLOCK = 65536;
 
+const TAGS: Record<Exclude<AiCompression, "none">, string> = { zstd: "%AI24_ZStandard_Data", deflate: "%AI12_CompressedData" };
+
 /** Splits and (optionally) compresses the native stream into AIPrivateData blocks. */
 export function encodePrivateData(stream: Uint8Array | Uint8Array[], opts: SaveOptions = {}): Uint8Array[] {
   const parts = Array.isArray(stream) ? stream : [stream];
   const block = opts.blockSize ?? BLOCK;
+  const compression = opts.compression ?? "zstd";
   let payload: Uint8Array;
-  if ((opts.compression ?? "deflate") === "none") {
+  if (compression === "none") {
     payload = parts.length === 1 ? parts[0] : concatBytes(parts);
   } else {
-    // zlib framing (78 9C ... adler32) after the tag, as Illustrator CS2-2019 wrote it.
-    const out = new ByteWriter();
-    out.str("%AI12_CompressedData");
-    const z = new Zlib({ level: (opts.compressionLevel ?? 6) as 6 }, (chunk) => {
-      out.bytes(chunk);
-    });
-    const STEP = 1 << 24;
-    if (parts.length === 0) z.push(new Uint8Array(0), true);
-    parts.forEach((p, i) => {
-      if (p.length === 0) {
-        if (i === parts.length - 1) z.push(p, true);
-        return;
-      }
-      for (let o = 0; o < p.length; o += STEP) z.push(p.subarray(o, Math.min(p.length, o + STEP)), i === parts.length - 1 && o + STEP >= p.length);
-    });
-    payload = out.toBytes();
+    const tag = fromLatin1(TAGS[compression]);
+    const body = compression === "zstd" ? zstdCompress(parts, opts.compressionLevel ?? 3) : deflate(parts, opts.compressionLevel ?? 6);
+    payload = concatBytes([tag, body]);
   }
   const blocks: Uint8Array[] = [];
   for (let o = 0; o < payload.length; o += block) blocks.push(payload.subarray(o, Math.min(payload.length, o + block)));
@@ -85,7 +76,7 @@ function writePrivate(pdf: PdfBuilder, privNum: number, blocks: Uint8Array[], me
   dict.ContainerVersion = 12;
   dict.CreatorVersion = info.creatorVersion ?? 30;
   dict.NumBlock = blocks.length;
-  dict.RoundtripStreamType = compression === "none" ? 0 : 1;
+  dict.RoundtripStreamType = compression === "zstd" ? 2 : compression === "deflate" ? 1 : 0;
   dict.RoundtripVersion = info.roundtripVersion ?? 24;
   pdf.object(privNum, dict);
 }
@@ -103,7 +94,12 @@ function pdfDate(d = new Date()): string {
  */
 export function saveAiFile(doc: AiDocument, container?: AiContainer, options: SaveOptions = {}): Uint8Array {
   const stream = serializeAiStream(doc, options);
-  const blocks = encodePrivateData(stream, options);
+  const original = container?.compression;
+  const compression = options.compression ?? (original === "deflate" || original === "zstd" ? original : "zstd");
+  // An unchanged stream (serializeAiStream returns the source itself) keeps its compressed blocks.
+  const reuse = stream === container?.stream && container.privateBlocks && compression === original && options.compressionLevel === undefined && options.blockSize === undefined;
+  const blocks = reuse ? container.privateBlocks! : encodePrivateData(stream, { ...options, compression });
+  options = { ...options, compression };
   const meta = container?.metadata ?? headerOf(stream);
   const strategy = options.rendition ?? (container?.pdf ? "keep" : "generate");
   if (strategy === "keep" && container?.pdf && container.privateInfo?.privateObject !== undefined) {
@@ -134,7 +130,7 @@ function keepRendition(src: PdfReader, privNum: number, blocks: Uint8Array[], me
     }
     pdf.rawObject(num, src.bytes.subarray(e.a, end));
   }
-  writePrivate(pdf, privNum, blocks, meta, { creatorVersion: c.privateInfo?.creatorVersion, roundtripVersion: c.privateInfo?.roundtripVersion }, options.compression ?? "deflate");
+  writePrivate(pdf, privNum, blocks, meta, { creatorVersion: c.privateInfo?.creatorVersion, roundtripVersion: c.privateInfo?.roundtripVersion }, options.compression ?? "zstd");
   const trailer: Record<string, PVal> = {};
   for (const k of ["Root", "Info", "ID"]) {
     const v = src.trailer.get(k);
@@ -159,7 +155,7 @@ function generateRendition(doc: AiDocument, blocks: Uint8Array[], meta: Uint8Arr
   pdf.object(pagesNum, { Type: name("Pages"), Kids: pages.map(ref), Count: pages.length });
   pdf.object(catalog, { Type: name("Catalog"), Pages: ref(pagesNum), OCProperties: { OCGs: [ref(ocg)], D: { ON: [ref(ocg)], Order: [ref(ocg)], RBGroups: [] } } });
   pdf.object(pieceNum, { LastModified: now, Private: ref(privNum) });
-  writePrivate(pdf, privNum, blocks, meta, { creatorVersion: c?.privateInfo?.creatorVersion, roundtripVersion: c?.privateInfo?.roundtripVersion }, options.compression ?? "deflate");
+  writePrivate(pdf, privNum, blocks, meta, { creatorVersion: c?.privateInfo?.creatorVersion, roundtripVersion: c?.privateInfo?.roundtripVersion }, options.compression ?? "zstd");
   const info = pdf.alloc();
   pdf.object(info, { Creator: "ai-file", Producer: "ai-file", CreationDate: now, ModDate: now, Title: options.title ?? "Untitled" });
   return pdf.finish({ Root: ref(catalog), Info: ref(info) });

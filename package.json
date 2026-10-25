@@ -43,11 +43,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.ts",
     "inspect": "node scripts/ai-inspect.ts",
-    "prepare": "npm run build"
-  },
-  "dependencies": {
-    "fflate": "^0.8.2",
-    "fzstd": "^0.1.1"
+    "prepare": "npm run build",
+    "build:wasm": "node scripts/build-wasm.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
